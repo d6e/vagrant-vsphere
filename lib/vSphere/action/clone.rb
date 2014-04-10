@@ -21,12 +21,13 @@ module VagrantPlugins
           name = get_name machine, config
           dc = get_datacenter connection, machine
           template = dc.find_vm config.template_name
+          disk_size_in_gb = config.disk_size.to_i
 
           raise Error::VSphereError, :message => I18n.t('vsphere.errors.missing_template') if template.nil?
 
           begin
             location = get_location connection, machine, config, template
-            spec = RbVmomi::VIM.VirtualMachineCloneSpec :location => location, :powerOn => true, :template => false
+            spec = RbVmomi::VIM.VirtualMachineCloneSpec :location => location, :powerOn => false, :template => false
             customization_info = get_customization_spec_info_by_name connection, machine
 
             spec[:customization] = get_customization_spec(machine, customization_info) unless customization_info.nil?
@@ -34,8 +35,12 @@ module VagrantPlugins
             env[:ui].info I18n.t('vsphere.creating_cloned_vm')
             env[:ui].info " -- #{config.clone_from_vm ? "Source" : "Template"} VM: #{config.template_name}"
             env[:ui].info " -- Name: #{name}"
+            env[:ui].info " -- Disk size: #{disk_size_in_gb}" if disk_size_in_gb.to_i > 0
 
             new_vm = template.CloneVM_Task(:folder => template.parent, :name => name, :spec => spec).wait_for_completion
+            
+            resize_disk(new_vm, disk_size_in_gb) if disk_size_in_gb.to_i > 0
+            new_vm.PowerOnVM_Task.wait_for_completion
           rescue Exception => e
             puts e.message
             raise Errors::VSphereError, :message => e.message
@@ -54,6 +59,24 @@ module VagrantPlugins
         end
 
         private
+  
+        def resize_disk(machine, size)
+          # get current vm disk
+          virtual_disk = machine.config.hardware.device.grep(RbVmomi::VIM::VirtualDisk)[0]
+          virtual_disk.capacityInKB = size * 1024 * 1024;
+
+          # execute reconfigure task          
+          new_vm_spec = RbVmomi::VIM.VirtualMachineConfigSpec(
+            :deviceChange => [RbVmomi::VIM.VirtualDeviceConfigSpec(
+              :device => virtual_disk,
+              :operation => RbVmomi::VIM.VirtualDeviceConfigSpecOperation(:edit)
+            )]
+          )
+          task = machine.ReconfigVM_Task(:spec => new_vm_spec)
+          task.wait_for_completion
+          { 'task_state' => task.info.state }
+        end
+
 
         def get_customization_spec(machine, spec_info)
           customization_spec = spec_info.spec.clone
